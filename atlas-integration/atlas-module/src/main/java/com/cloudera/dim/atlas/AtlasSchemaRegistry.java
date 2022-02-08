@@ -43,6 +43,7 @@ import com.hortonworks.registries.schemaregistry.cache.SchemaRegistryCacheType;
 import com.hortonworks.registries.schemaregistry.errors.IncompatibleSchemaException;
 import com.hortonworks.registries.schemaregistry.errors.InvalidSchemaBranchDeletionException;
 import com.hortonworks.registries.schemaregistry.errors.InvalidSchemaException;
+import com.hortonworks.registries.schemaregistry.errors.InvalidVersionException;
 import com.hortonworks.registries.schemaregistry.errors.SchemaBranchAlreadyExistsException;
 import com.hortonworks.registries.schemaregistry.errors.SchemaBranchNotFoundException;
 import com.hortonworks.registries.schemaregistry.errors.SchemaNotFoundException;
@@ -539,6 +540,43 @@ public class AtlasSchemaRegistry implements ISchemaRegistry, SchemaVersionRetrie
     public CompatibilityResult checkCompatibility(String schemaBranchName, String schemaName, String toSchemaText) throws SchemaNotFoundException, SchemaBranchNotFoundException {
         LOG.info("---------------2 checkCompatibility {} {} {} {}", schemaName, schemaBranchName, schemaName, toSchemaText);
         return schemaVersionLifecycleManager.checkCompatibility(schemaBranchName, schemaName, toSchemaText);
+    }
+
+    @Override
+    public CompatibilityResult checkCompatibilityWithVersion(String schemaName, String toSchemaText, String versionId) throws InvalidVersionException, SchemaNotFoundException, SchemaBranchNotFoundException {
+        LOG.info("---------------3 checkCompatibility {} {} with version {}", schemaName, toSchemaText, versionId);
+        SchemaVersionInfo schemaVersionInfo = null;
+        if ("latest".equals(versionId)) {
+            schemaVersionInfo = getLatestSchemaVersionInfo(schemaName);
+        } else {
+            SchemaVersionInfo fetchedSchemaVersionInfo = null;
+            try {
+                Integer version = Integer.valueOf(versionId);
+                if (version > 0 && version <= Integer.MAX_VALUE) {
+                    fetchedSchemaVersionInfo = getSchemaVersionInfo(new SchemaVersionKey(schemaName, version));
+                } else {
+                    LOG.error("versionId is not in valid range [{}, {}] ", 1, Integer.MAX_VALUE);
+                }
+            } catch (NumberFormatException e) {
+                LOG.error("Invalid version id string ", versionId, e);
+            } catch (SchemaNotFoundException e) {
+                LOG.error("Schema version not found with version id [{}]", versionId, e);
+            }
+
+            if (fetchedSchemaVersionInfo != null) {
+                if (schemaName.equals(fetchedSchemaVersionInfo.getName())) {
+                    schemaVersionInfo = fetchedSchemaVersionInfo;
+                } else {
+                    LOG.error("Received schema version for id [{}] belongs to subject [{}] which is different from requested subject [{}]",
+                            versionId, fetchedSchemaVersionInfo.getName(), schemaName);
+                }
+            }
+        }
+        if (schemaVersionInfo == null) {
+            throw new InvalidVersionException("The specific version of the schema does not exist.");
+        } else {
+            return schemaVersionLifecycleManager.checkCompatibilityWithVersion(schemaName, toSchemaText, schemaVersionInfo.getSchemaText());
+        }
     }
 
     @Override

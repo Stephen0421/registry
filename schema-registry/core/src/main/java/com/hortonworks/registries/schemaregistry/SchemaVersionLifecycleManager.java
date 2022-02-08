@@ -403,6 +403,17 @@ public abstract class SchemaVersionLifecycleManager {
         return compatibilityResult != null ? compatibilityResult : CompatibilityResult.createCompatibleResult(toSchema);
     }
 
+    public CompatibilityResult checkCompatibilityWithVersion(String schemaName,
+                                                             String toSchema,
+                                                             String existingSchema) throws SchemaBranchNotFoundException {
+        SchemaMetadataInfo schemaMetadataInfo = getSchemaMetadataInfo(schemaName);
+        SchemaMetadata schemaMetadata = schemaMetadataInfo.getSchemaMetadata();
+        return checkCompatibility(schemaMetadata.getType(),
+                                  toSchema,
+                                  existingSchema,
+                                  schemaMetadata.getCompatibility());
+    }
+
     protected CompatibilityResult checkCompatibility(String type,
                                                    String toSchema,
                                                    String existingSchema,

@@ -19,8 +19,11 @@ import com.codahale.metrics.annotation.Timed;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hortonworks.registries.common.catalog.CatalogResponse;
+import com.hortonworks.registries.schemaregistry.CompatibilityResult;
 import com.hortonworks.registries.schemaregistry.authorizer.core.util.AuthorizationUtils;
 import com.hortonworks.registries.schemaregistry.authorizer.exception.AuthorizationException;
+import com.hortonworks.registries.schemaregistry.errors.InvalidVersionException;
+import com.hortonworks.registries.schemaregistry.errors.SchemaBranchNotFoundException;
 import com.hortonworks.registries.storage.transaction.UnitOfWork;
 import com.hortonworks.registries.common.util.WSUtils;
 import com.hortonworks.registries.schemaregistry.ISchemaRegistry;
@@ -44,6 +47,7 @@ import io.swagger.annotations.ApiParam;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.ws.rs.DELETE;
 import javax.ws.rs.GET;
 import javax.ws.rs.POST;
 import javax.ws.rs.Path;
@@ -55,9 +59,12 @@ import javax.ws.rs.core.Response;
 import javax.ws.rs.core.SecurityContext;
 import javax.ws.rs.core.UriInfo;
 import java.io.IOException;
+import java.lang.reflect.UndeclaredThrowableException;
 import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
+
+import static com.hortonworks.registries.schemaregistry.SchemaBranch.MASTER_BRANCH;
 
 /**
  * Schema Registry resource that provides schema registry REST service.
@@ -301,7 +308,7 @@ public class ConfluentSchemaRegistryCompatibleResource extends BaseRegistryResou
                         schemaVersionInfo, Authorizer.AccessType.READ);
                 response = WSUtils.respondEntity(new Schema(schemaVersionInfo.getName(), schemaVersionInfo.getVersion(), schemaVersionInfo.getId(), schemaVersionInfo.getSchemaText()), Response.Status.OK);
             } else {
-                response = WSUtils.respond(Response.Status.NOT_FOUND, CatalogResponse.ResponseMessage.ENTITY_NOT_FOUND, subject);
+                response = schemaNotFoundError();
             }
         } catch (AuthorizationException e) {
             LOG.debug("Access denied. ", e);
@@ -374,6 +381,249 @@ public class ConfluentSchemaRegistryCompatibleResource extends BaseRegistryResou
             response = incompatibleSchemaError();
         } catch (Exception ex) {
             LOG.error("Encountered error while adding subject [{}]", subject, ex);
+            response = serverError();
+        }
+
+        return response;
+    }
+
+    @GET
+    @Path("/subjects/{subject}/versions/{version}/schema")
+    @ApiOperation(value="Get the schema text for given subject and version",
+                 response = String.class, tags = OPERATION_GROUP_CONFLUENT_SR)
+    @Timed
+    @UnitOfWork
+    public Response getSchemaOnlyAccordingToVersion(@ApiParam(value = "subject", required = true) @PathParam("subject")
+                                                            String subject,
+                                                    @ApiParam(value = "version", required = true) @PathParam("version")
+                                                            String versionId,
+                                                    @Context UriInfo uriInfo,
+                                                    @Context SecurityContext securityContext){
+        Response response;
+        try {
+            SchemaVersionInfo schemaVersionInfo = null;
+            SchemaMetadataInfo schemaMetadataInfo = schemaRegistry.getSchemaMetadataInfo(subject);
+            if ("latest".equals(versionId)) {
+                schemaVersionInfo = schemaRegistry.getLatestSchemaVersionInfo(subject);
+            } else {
+                if (schemaMetadataInfo == null) {
+                    throw new SchemaNotFoundException();
+                }
+                SchemaVersionInfo fetchedSchemaVersionInfo = null;
+                try {
+                    Integer version = Integer.valueOf(versionId);
+                    if (version > 0 && version <= Integer.MAX_VALUE) {
+                        fetchedSchemaVersionInfo = schemaRegistry.getSchemaVersionInfo(new SchemaVersionKey(subject, version));
+                    } else {
+                        LOG.error("versionId is not in valid range [{}, {}] ", 1, Integer.MAX_VALUE);
+                    }
+                } catch (NumberFormatException e) {
+                    LOG.error("Invalid version id string ", versionId, e);
+                } catch (SchemaNotFoundException e) {
+                    LOG.error("Schema version not found with version id [{}]", versionId, e);
+                }
+
+                if (fetchedSchemaVersionInfo != null) {
+                    if (subject.equals(fetchedSchemaVersionInfo.getName())) {
+                        schemaVersionInfo = fetchedSchemaVersionInfo;
+                    } else {
+                        LOG.error("Received schema version for id [{}] belongs to subject [{}] which is different from requested subject [{}]",
+                                versionId, fetchedSchemaVersionInfo.getName(), subject);
+                    }
+                }
+            }
+
+            if (schemaVersionInfo == null) {
+                response = versionNotFoundError();
+            } else {
+                authorizationAgent.authorizeSchemaVersion(AuthorizationUtils.getUserAndGroups(securityContext), schemaRegistry,
+                        schemaVersionInfo, Authorizer.AccessType.READ);
+                response = WSUtils.respondEntity(schemaVersionInfo.getSchemaText(), Response.Status.OK);
+            }
+        } catch (AuthorizationException e) {
+            LOG.debug("Access denied. ", e);
+            return WSUtils.respond(Response.Status.FORBIDDEN, CatalogResponse.ResponseMessage.ACCESS_DENIED, e.getMessage());
+        } catch (SchemaNotFoundException ex) {
+            LOG.error("No schema found with subject [{}]", subject, ex);
+            response = subjectNotFoundError();
+        } catch (Exception ex) {
+            LOG.error("Encountered error while retrieving all subjects", ex);
+            response = serverError();
+        }
+        return response;
+    }
+
+    @DELETE
+    @Path("/subjects/{subject}")
+    @ApiOperation(value = "Delete a schema metadata and all related data",
+            response = Integer.class, responseContainer = "List", tags = OPERATION_GROUP_CONFLUENT_SR)
+    @Timed
+    @UnitOfWork
+    public Response deleteSubject(@ApiParam(value = "subject", required = true) @PathParam("subject")
+                                              String subject,
+                                  @Context UriInfo uriInfo,
+                                  @Context SecurityContext securityContext) {
+        Response response;
+        try {
+            authorizationAgent.authorizeDeleteSchemaMetadata(AuthorizationUtils.getUserAndGroups(securityContext),
+                    schemaRegistry,
+                    subject);
+            List<Integer> versions = schemaRegistry.getAllVersions(subject)
+                    .stream()
+                    .map(versionInfo -> versionInfo.getVersion())
+                    .collect(Collectors.toList());
+            schemaRegistry.deleteSchema(subject);
+            response = WSUtils.respondEntity(versions, Response.Status.OK);
+        } catch (AuthorizationException e) {
+            LOG.debug("Access denied. ", e);
+            return WSUtils.respond(Response.Status.FORBIDDEN, CatalogResponse.ResponseMessage.ACCESS_DENIED, e.getMessage());
+        } catch (SchemaNotFoundException ex) {
+            LOG.error("No schema found with subject [{}]", subject, ex);
+            response = subjectNotFoundError();
+        } catch (Exception ex) {
+            LOG.error("Encountered error while retrieving all subjects", ex);
+            response = serverError();
+        }
+
+        return response;
+    }
+
+    @DELETE
+    @Path("/subjects/{subject}/versions/{versionId}")
+    @ApiOperation(value = "Delete a specific version of schema metadata and all related data",
+            response = Integer.class, tags = OPERATION_GROUP_CONFLUENT_SR)
+    @Timed
+    @UnitOfWork
+    public Response deleteSubjectVersions(@ApiParam(value = "subject", required = true) @PathParam("subject")
+                                                      String subject,
+                                          @ApiParam(value = "version of the schema", required = true) @PathParam("versionId")
+                                                  String versionId,
+                                          @Context UriInfo uriInfo,
+                                          @Context SecurityContext securityContext) {
+        Response response;
+        try {
+            SchemaVersionKey schemaVersionKey = null;
+            SchemaVersionInfo schemaVersionInfo = null;
+            if ("latest".equals(versionId)) {
+                schemaVersionInfo = schemaRegistry.getLatestSchemaVersionInfo(subject);
+                schemaVersionKey = new SchemaVersionKey(subject, schemaVersionInfo.getVersion());
+            } else {
+                SchemaVersionInfo fetchedSchemaVersionInfo = null;
+                try {
+                    Integer version = Integer.valueOf(versionId);
+                    if (version > 0 && version <= Integer.MAX_VALUE) {
+                        fetchedSchemaVersionInfo = schemaRegistry.getSchemaVersionInfo(new SchemaVersionKey(subject, version));
+                    } else {
+                        LOG.error("versionId is not in valid range [{}, {}] ", 1, Integer.MAX_VALUE);
+                    }
+                } catch (NumberFormatException e) {
+                    LOG.error("Invalid version id string ", versionId, e);
+                } catch (SchemaNotFoundException e) {
+                    LOG.error("Schema version not found with version id [{}]", versionId, e);
+                }
+
+                if (fetchedSchemaVersionInfo != null) {
+                    if (subject.equals(fetchedSchemaVersionInfo.getName())) {
+                        schemaVersionInfo = fetchedSchemaVersionInfo;
+                        schemaVersionKey = new SchemaVersionKey(subject, schemaVersionInfo.getVersion());
+                    } else {
+                        LOG.error("Received schema version for id [{}] belongs to subject [{}] which is different from requested subject [{}]",
+                                versionId, fetchedSchemaVersionInfo.getName(), subject);
+                    }
+                }
+            }
+
+            if (schemaVersionInfo == null) {
+                response = versionNotFoundError();
+            } else {
+                authorizationAgent.authorizeSchemaVersion(AuthorizationUtils.getUserAndGroups(securityContext), schemaRegistry,
+                        schemaVersionKey, Authorizer.AccessType.DELETE);
+                schemaRegistry.deleteSchemaVersion(schemaVersionKey);
+                response = WSUtils.respondEntity(schemaVersionKey.getVersion(), Response.Status.OK);
+            }
+        } catch (AuthorizationException e) {
+            LOG.debug("Access denied. ", e);
+            return WSUtils.respond(Response.Status.FORBIDDEN, CatalogResponse.ResponseMessage.ACCESS_DENIED, e.getMessage());
+        } catch (SchemaNotFoundException ex) {
+            LOG.error("No schema found with subject [{}]", subject, ex);
+            response = schemaNotFoundError();
+        } catch (Exception ex) {
+            LOG.error("Encountered error while retrieving all subjects", ex);
+            response = serverError();
+        }
+
+        return response;
+    }
+
+    @POST
+    @Path("/compatibility/subjects/{subject}/versions")
+    @ApiOperation(value = "Checks if the given schema text is compatible with all the versions of the schema identified by the name",
+            response = Boolean.class, tags = OPERATION_GROUP_CONFLUENT_SR)
+    @Timed
+    @UnitOfWork
+    public Response checkCompatibilityWithSchema(@ApiParam(value = "subject", required = true) @PathParam("subject")
+                                                             String subject,
+                                                 @ApiParam(value = "schema text to be checked for compatibility", required = true) String schemaText,
+                                                 @Context UriInfo uriInfo,
+                                                 @Context SecurityContext securityContext) {
+        Response response;
+        try {
+            authorizationAgent.authorizeSchemaVersion(AuthorizationUtils.getUserAndGroups(securityContext), schemaRegistry, subject,
+                    MASTER_BRANCH, Authorizer.AccessType.READ);
+            CompatibilityResult compatibilityResult = schemaRegistry.checkCompatibility(MASTER_BRANCH, subject, schemaStringFromJson(schemaText).getSchema());
+            response = WSUtils.respondEntity(Collections.singletonMap("is_compatible", compatibilityResult.isCompatible()), Response.Status.OK);
+        } catch (AuthorizationException e) {
+            LOG.debug("Access denied. ", e);
+            return WSUtils.respond(Response.Status.FORBIDDEN, CatalogResponse.ResponseMessage.ACCESS_DENIED, e.getMessage());
+        } catch (SchemaNotFoundException e) {
+            LOG.error("No schemas found with schemakey: [{}]", subject, e);
+            response = schemaNotFoundError();
+        } catch (SchemaBranchNotFoundException e) {
+            return WSUtils.respond(Response.Status.NOT_FOUND, CatalogResponse.ResponseMessage.ENTITY_NOT_FOUND,  e.getMessage());
+        } catch (Exception ex) {
+            if (ex instanceof UndeclaredThrowableException) {
+                ex = (Exception) ((UndeclaredThrowableException)ex).getUndeclaredThrowable();
+            }
+            LOG.error("Encountered error while checking compatibility with versions of schema with [{}] for given schema text [{}]", subject, schemaText, ex);
+            response = serverError();
+        }
+
+        return response;
+    }
+
+    @POST
+    @Path("/compatibility/subjects/{subject}/versions/{versionId}")
+    @ApiOperation(value = "Checks if the given schema text is compatible with the specific version of the schema identified by the name",
+            response = Boolean.class, tags = OPERATION_GROUP_CONFLUENT_SR)
+    @Timed
+    @UnitOfWork
+    public Response checkCompatibilityWithVersion(@ApiParam(value = "subject", required = true) @PathParam("subject")
+                                                              String subject,
+                                                  @ApiParam(value = "version of the schema", required = true) @PathParam("versionId")
+                                                              String versionId,
+                                                  @ApiParam(value = "schema text to be checked for compatibility", required = true) String schemaText,
+                                                  @Context UriInfo uriInfo,
+                                                  @Context SecurityContext securityContext) {
+        Response response;
+        try {
+            CompatibilityResult compatibilityResult = schemaRegistry.checkCompatibilityWithVersion(subject, schemaStringFromJson(schemaText).getSchema(), versionId);
+            response = WSUtils.respondEntity(Collections.singletonMap("is_compatible", compatibilityResult.isCompatible()), Response.Status.OK);
+        } catch (AuthorizationException e) {
+            LOG.debug("Access denied. ", e);
+            return WSUtils.respond(Response.Status.FORBIDDEN, CatalogResponse.ResponseMessage.ACCESS_DENIED, e.getMessage());
+        } catch (SchemaNotFoundException e) {
+            LOG.error("No schemas found with schemakey: [{}]", subject, e);
+            response = schemaNotFoundError();
+        } catch (SchemaBranchNotFoundException e) {
+            return WSUtils.respond(Response.Status.NOT_FOUND, CatalogResponse.ResponseMessage.ENTITY_NOT_FOUND,  e.getMessage());
+        } catch (InvalidVersionException e) {
+            LOG.error("The specific version [{}] of the schema [{}] does not exist.", versionId, subject, e);
+            response = versionNotFoundError();
+        } catch (Exception ex) {
+            if (ex instanceof UndeclaredThrowableException) {
+                ex = (Exception) ((UndeclaredThrowableException)ex).getUndeclaredThrowable();
+            }
+            LOG.error("Encountered error while checking compatibility with versions of schema with [{}] for given schema text [{}]", subject, schemaText, ex);
             response = serverError();
         }
 

@@ -17,6 +17,7 @@ package com.hortonworks.registries.schemaregistry;
 import com.hortonworks.registries.schemaregistry.cache.SchemaRegistryCacheType;
 import com.hortonworks.registries.schemaregistry.errors.IncompatibleSchemaException;
 import com.hortonworks.registries.schemaregistry.errors.InvalidSchemaException;
+import com.hortonworks.registries.schemaregistry.errors.InvalidVersionException;
 import com.hortonworks.registries.schemaregistry.errors.SchemaBranchNotFoundException;
 import com.hortonworks.registries.schemaregistry.errors.SchemaNotFoundException;
 
@@ -209,6 +210,18 @@ public interface ISchemaRegistry extends ISchemaRegistryService {
      * @param keyAsString serialized version of the key of the cache
      */
     void invalidateCache(SchemaRegistryCacheType schemaRegistryCacheType, String keyAsString);
+
+    /**
+     * @param schemaName   name identifying a schema
+     * @param toSchemaText text representing the schema to be checked for compatibility
+     * @param versionId the compare version
+     *
+     * @return true if the given {@code toSchemaText} is compatible with the validation level of the schema with id as {@code schemaName}.
+     *
+     * @throws InvalidVersionException if there is no the specific version existed.
+     * @throws SchemaNotFoundException if there is no schema metadata registered with the given {@code schemaName}
+     */
+    CompatibilityResult checkCompatibilityWithVersion(String schemaName, String toSchemaText, String versionId) throws InvalidVersionException, SchemaNotFoundException, SchemaBranchNotFoundException;
 
     class Options {
         // we may want to remove schema.registry prefix from configuration properties as these are all properties
